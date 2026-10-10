@@ -8,11 +8,13 @@ an original BLE product ID and the Bluetooth HID bus. A USB device reporting
 original controller's BLE ID; the pre-existing `11fc`, `11ff`, `1201`, and `0476`
 aliases are not treated as original-controller transports.
 
-Original USB, receiver, and BLE behavior has production-path host tests. Physical
-original-controller operation remains unverified on all three transports. BLE
-pairing, firmware behavior, radio timing, gyro/haptic feel, and sleep/reconnect
-must still be checked on real original hardware. Bluetooth pairing belongs to
-the host's Bluetooth service; this driver does not pair devices or update their
+Original USB, receiver, and BLE behavior has production-path host tests. A real
+original controller has now paired and connected over BLE on MiSTer, exposing
+`28de:1106` on the Bluetooth HID bus and producing captured raw sensor reports.
+This proves pairing and a raw sensor stream, not virtual control behavior,
+physical gyro/haptic feel, or playability. Original USB/receiver hardware input
+and BLE sleep/reconnect acceptance also remain pending. Bluetooth pairing belongs
+to the host's Bluetooth service; this driver does not pair devices or update their
 firmware. The OS must expose a paired controller through `/dev/hidraw`.
 
 The original-controller implementation has host tests and an ARM build. The
@@ -191,8 +193,12 @@ chunk-mask combinations (including every segment boundary), atomic rejection,
 new-first-frame restart, retained state, gyro-only freshness/calibration/output,
 stale stick-assistance release, discovery by bus and ID, feature commands of
 lengths 1–64, failed/short writes at each segment, configuration/haptic bytes,
-and disconnect/reconnect with continuing status chatter. BLE fixtures are
-protocol-derived; no real original BLE packets were captured.
+and disconnect/reconnect with continuing status chatter. The synthetic all-mask
+fixtures remain intact. A separate regression uses real original BLE accel+gyro
+(`0c00`), accel-only (`0400`), and empty-mask (`0000`) segments, asserting signed
+sensor values, retained gyro values without resampling, fresh-sample sequence
+advancement, and no state/liveness refresh from empty-mask traffic. Their replay
+order and host-test timing are controlled, not a reconstruction of capture timing.
 The newer fixture is a real 54-byte USB
 `42` report captured before this change, not an original-controller capture.
 
@@ -232,8 +238,23 @@ the newer wired `28de:1302` controller's raw stream, created all four virtual
 devices, and grabbed the physical Valve pointer node after a menu refresh.
 A passive eight-second capture saw 1,983 valid newer state reports, compared with
 1,984 before installation. The controller was idle, so no button or pad changes
-were observed. Original-controller USB/receiver/BLE input and pairing, physical
-haptics/gyro, and navigation/in-core acceptance remain pending.
+were observed. That smoke check did not establish original-controller input or
+physical haptics/gyro and navigation/in-core acceptance.
+
+## Original BLE pairing and raw sensor evidence (2026-10-11)
+
+MiSTer's BlueZ 5.61 reports the original controller paired, trusted, and connected.
+Its hidraw device identifies as Bluetooth HID `28de:1106`. Two passive captures
+recorded 4,056 segments over 45.029 seconds and 7,365 segments over 55 seconds.
+These totals describe captured traffic, not a measured gyro sampling frequency.
+Curated state segments include combined acceleration/gyro, acceleration-only,
+and empty-mask frames; real samples are retained in the host regression tests
+without device addresses, identity data, or status payloads.
+
+No virtual control changes were observed in these passive captures. Physical
+button/pad/stick/trigger tests, virtual mappings, gyro direction and feel, haptics,
+sleep/reconnect, and MiSTer navigation/in-core playtest acceptance remain pending.
+The user-controlled physical input test is the next acceptance gate.
 
 ## Protocol provenance
 

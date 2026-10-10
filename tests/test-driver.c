@@ -375,6 +375,43 @@ static void test_ble_gyro_freshness(void){
     n=ble_fixture(p,0x800);
     reset_ble();for(i=0;i<80;i++)ble_feed_payload(p,n);assert(!gyro.bias_ready&&!gyro.total_reports);
 }
+static void test_captured_original_ble_sensors(void){
+    /* Real original1106 state segments curated from original-ble-frames.json.
+     * Replayed in a controlled order; this does not reproduce capture timing.
+     * No identity or status payloads are included. */
+    u8 captured[][20]={
+        {0x03,0xc0,0x04,0x0c,0x5c,0x02,0x32,0xf9,0x92,0x3f,0xfe,0xff,0xff,0xff,0xfb,0xff,0,0,0,0},
+        {0x03,0xc0,0x04,0x04,0x93,0x02,0x95,0xf8,0xc6,0x3f,0,0,0,0,0,0,0,0,0,0},
+        {0x03,0xc0,0x04,0x00,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
+        {0x03,0xc0,0x04,0x0c,0x80,0x02,0x18,0xf9,0x65,0x3f,0xfb,0xff,0xff,0xff,0xfa,0xff,0,0,0,0}
+    };
+    struct original_state before;struct ble_state before_ble;u32 gyro_time;int count;
+    reset_ble();active_product=PRODUCT_SC_BLE2;
+    assert(feed(captured[0],20)==REPORT_STATE);
+    assert(gyro.prev_ax==604&&gyro.prev_ay==-1742&&gyro.prev_az==16274);
+    /* Raw gyro(-2,-1,-5) becomes(-2,+1,-5) in Orbit's sensor convention. */
+    assert(gyro.prev_gx==-2&&gyro.prev_gy==1&&gyro.prev_gz==-5);
+    assert(ble.gyro_fresh&&ble.imu_sequence==1&&gyro.fresh_reports==1);
+    gyro_time=ble.last_gyro_ms;
+    assert(feed(captured[1],20)==REPORT_STATE);
+    assert(le16s(original.report+34)==659&&le16s(original.report+36)==-1899&&le16s(original.report+38)==16326);
+    assert(le16s(original.report+40)==-2&&le16s(original.report+42)==1&&le16s(original.report+44)==-5);
+    assert(!ble.gyro_fresh&&ble.imu_sequence==1&&gyro.fresh_reports==1&&ble.last_gyro_ms==gyro_time);
+    before=original;before_ble=ble;count=event_count;
+    assert(feed(captured[2],20)==REPORT_IGNORED);
+    assert(!memcmp(&before,&original,sizeof(original))&&!memcmp(&before_ble,&ble,sizeof(ble)));
+    assert(event_count==count&&gyro.fresh_reports==1);
+    assert(feed(captured[3],20)==REPORT_STATE);
+    assert(gyro.prev_ax==640&&gyro.prev_ay==-1768&&gyro.prev_az==16229);
+    assert(gyro.prev_gx==-5&&gyro.prev_gy==1&&gyro.prev_gz==-6);
+    assert(ble.gyro_fresh&&ble.imu_sequence==2&&gyro.fresh_reports==2&&ble.last_gyro_ms>gyro_time);
+    /* Actual empty-mask traffic cannot renew the production loop's liveness. */
+    reset_ble();active_product=PRODUCT_SC_BLE2;
+    memcpy(input_queue[0],captured[0],20);memcpy(input_queue[1],captured[2],20);
+    input_lengths[0]=input_lengths[1]=20;queue_count=2;queue_enabled=repeat_status=1;
+    assert(run_controller(7,10,11,12,13)==-1&&clock_ms>=102000);
+    assert(!original.connected&&!ble.gyro_ready&&gyro.fresh_reports==1);
+}
 static void test_ble_features(void){
     u8 command[64];int n,i,j,segments;
     for(i=0;i<64;i++)command[i]=(u8)(0xa0+i);
@@ -424,6 +461,6 @@ int main(void){
     test_buttons_axes();test_stick_event_bounds();test_multiplex_and_touch();test_imu();test_shortcuts();
     test_haptics_features();test_newer();test_rejection_disconnect();
     test_ble_discovery();test_ble_all_chunk_boundaries();test_ble_retention_shortcuts();
-    test_ble_rejection_and_restart();test_ble_gyro_freshness();test_ble_features();test_ble_disconnect_loop();
+    test_ble_rejection_and_restart();test_ble_gyro_freshness();test_captured_original_ble_sensors();test_ble_features();test_ble_disconnect_loop();
     puts("PASS: production USB/receiver/BLE/newer input, outputs, shortcuts, IMU, haptics and disconnect loop");return 0;
 }
