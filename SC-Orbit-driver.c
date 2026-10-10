@@ -1124,7 +1124,7 @@ static s32 mul_scale_q8(s32 v,s32 q8);
 /* Original USB/receiver and BLE protocol facts are documented in COMPATIBILITY.md.
  * Independently implemented adapter: the processing engine still consumes its
  * existing 2026 layout. The untouched surface survives alternating reports. */
-enum report_result {REPORT_IGNORED,REPORT_STATE,REPORT_DISCONNECTED,REPORT_CONNECTED};
+enum report_result {REPORT_IGNORED,REPORT_STATE,REPORT_DISCONNECTED,REPORT_CONNECTED,REPORT_HEARTBEAT};
 struct original_state {int connected;s16 stick_x,stick_y,pad_x,pad_y;u8 report[54];};
 static struct original_state original;
 static void put16(u8 *p,u16 v){p[0]=(u8)v;p[1]=(u8)(v>>8);}
@@ -1225,7 +1225,12 @@ static int decode_ble_report(struct original_state *state,const u8 *raw,int n,co
         memset(&ble_assembly,0,sizeof(ble_assembly));
     if(index==0){
         memset(&ble_assembly,0,sizeof(ble_assembly));
-        if((raw[2]&15)!=4)return REPORT_IGNORED; /* Status 5 isn't input. */
+        /* Original BLE firmware may send only status/empty-state packets at
+         * rest. A complete single segment proves link activity, not input or
+         * IMU freshness. Never accept continuation/partial status as a beat. */
+        if(last&&(raw[2]==5||(raw[2]==4&&raw[3]==0)))
+            return REPORT_HEARTBEAT;
+        if((raw[2]&15)!=4)return REPORT_IGNORED;
         mask=(u16)((raw[2]&0xf0)|((u16)raw[3]<<8));total=ble_payload_size(mask);
         if(!total)return REPORT_IGNORED;
         ble_assembly.segments=(total+17)/18;ble_assembly.started_ms=now;
@@ -1676,6 +1681,11 @@ static const s32 tb_roll_friction_q16[10]={12000,10000,8500,7000,5600,4200,3300,
 static const s32 sp_counts_rev[10]={30,42,56,70,86,103,123,146,174,208};
 static const s32 sp_linear_scale_q16[10]={120,160,205,250,295,342,400,470,550,650};
 static const s32 sp_linear_max_step[10]={14,18,24,30,36,42,50,60,72,88};
+/* Original circular pad needs a finer low range. Keep level6/default and above
+ * identical; only original hardware uses these lower levels. Fractions remain
+ * in the existing accumulator, so slow motion can still reach the next count. */
+static const s32 sc1_counts_rev[10]={6,12,24,42,68,103,123,146,174,208};
+static const s32 sc1_linear_scale_q16[10]={24,48,88,144,224,342,400,470,550,650};
 /* Fluid circular encoder confidence. There is no broad center dead zone and no
  * reacquire delay. Radius now scales confidence continuously: imperfect circles
  * near the center slow gracefully instead of freezing and then jumping. Large
@@ -2037,7 +2047,7 @@ static void process_spinner(int hid,int spinner,int touch,s32 x,s32 y){
          * while never emitting movement after a quiet report. */
         ms.spinner_fx_q8+=(weighted_mag-ms.spinner_fx_q8)>>1;
         d=-dq13*cfg.spinner_direction;
-        ms.spinner_q16+=d*sp_counts_rev[active_spinner_speed()-1];
+        ms.spinner_q16+=d*(original_controller()?sc1_counts_rev:sp_counts_rev)[active_spinner_speed()-1];
         out=sdiv32(ms.spinner_q16,SPINNER_FULL_TURN_Q13);
         ms.spinner_q16-=out*SPINNER_FULL_TURN_Q13;
         spinner_trace_add(x,y,r,dq13,out,clipped?8:1);
@@ -2045,7 +2055,7 @@ static void process_spinner(int hid,int spinner,int touch,s32 x,s32 y){
         d=(x-ms.spinner_x_prev)*cfg.spinner_direction;
         if(iabs32(d)>SPINNER_LINEAR_DISCONTINUITY){ms.spinner_x_prev=x;ms.spinner_y_prev=y;ms.spinner_q16=0;return;}
         d=soft_gate(d);
-        ms.spinner_q16+=d*sp_linear_scale_q16[active_spinner_speed()-1];
+        ms.spinner_q16+=d*(original_controller()?sc1_linear_scale_q16:sp_linear_scale_q16)[active_spinner_speed()-1];
         limit=sp_linear_max_step[active_spinner_speed()-1];
         out=consume_q16_limited(&ms.spinner_q16,limit);
         ms.spinner_x_prev=x;ms.spinner_y_prev=y;
@@ -2657,6 +2667,7 @@ static int run_controller(int hid,int gp,int mouse,int spinner,int keypad){
                 int result=process_input_report(hid,gp,mouse,spinner,keypad,b,(int)n);
                 if(result==REPORT_DISCONNECTED)return -1;
                 if(result==REPORT_CONNECTED){(void)configure_controller(hid);active=0;misses=0;}
+                if(result==REPORT_HEARTBEAT&&active&&original_ble())last_state_ms=monotonic_ms();
                 if(result==REPORT_STATE){
                     got=1;misses=0;last_state_ms=monotonic_ms();
                     if(!active){
@@ -2673,7 +2684,8 @@ static int run_controller(int hid,int gp,int mouse,int spinner,int keypad){
         if(active){
             u32 now=monotonic_ms();expire_ble_gyro(gp);
             /* Original wireless receiver remains present when its controller
-             * vanishes. Battery/status traffic must not keep held input alive. */
+             * vanishes. Its battery/status traffic cannot keep held input alive.
+             * BLE alone accepts validated idle heartbeats after activation. */
             if(original_controller()&&(u32)(now-last_state_ms)>2000U){release_controller_outputs(hid,gp,mouse,spinner,keypad);return -1;}
             if((s32)(now-next_coast)>=0){
                 int coast_steps=0;

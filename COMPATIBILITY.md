@@ -56,6 +56,36 @@ holding the modifier; each action fires once per press.
 | Select/View | Load profile |
 | Steam | Restore defaults |
 
+SC1 spinner speed levels 1–5 have a lower gain range for fine movement; level 6
+(the unchanged default) through 10 retain the original gain. Existing saved
+levels still apply, so a controller already at level 1 immediately uses the new
+minimum. Both-grips + left/right shoulder changes the selected circular or
+horizontal speed one level per press, clamped to 1–10. Release the shoulder
+between adjustments. The two modes retain independent settings. SC2 gains,
+defaults and shortcuts are unchanged.
+
+Production-path replay measured these absolute `REL_DIAL` counts at levels 1–6:
+
+| Prescribed pad motion | Prior SC1 / unchanged SC2 | New SC1 |
+| --- | --- | --- |
+| One radius-24000 circle, 32 equal steps | 30, 42, 56, 70, 86, 103 | 6, 12, 24, 42, 68, 103 |
+| Horizontal 32768-unit stroke, 64 equal steps | 59, 79, 101, 124, 146, 169 | 11, 23, 43, 71, 111, 169 |
+
+The minimum gain is one fifth of the former minimum; integer output counts also
+reflect quantization. Small motion is accumulated: at SC1 horizontal level 1,
+a 32-unit step emits no whole count, while 256 consecutive steps emit 2 counts.
+These are synthetic coordinate replays through the production decoder, shortcut
+processing and virtual events at 9 ms intervals, not measured Arkanoid paddle
+travel or physical feel. USB, receiver and BLE produce the same counts; tests
+check every speed level and preserve SC2's exact baseline counts. Live inspection
+for the reported sensitivity issue found circular level 1 with gyro disabled,
+confirming that the shortcut had reached its old minimum. Physical acceptance of
+the expanded range remains pending.
+
+When gyro master is enabled, the spinner pad instead clutches Gyro Paddle;
+its sensitivity uses the gyro setting rather than either pad-speed setting.
+That existing behavior is unchanged.
+
 For gyro settings, **hold both rear grips and hold the stick clicked**, then:
 
 | Additional control | Action |
@@ -108,8 +138,8 @@ cannot activate it without a right-stick touch signal.
   liveness. Explicit disconnect releases all virtual outputs and clears the
   adapter. Duplicate connect notifications are ignored once connected. The loop
   reconfigures on a genuine connect and rescans after disconnect. Two seconds
-  without a valid original state report releases outputs and resumes scanning,
-  including if a receiver continues sending status chatter. This timeout assumes
+  without a valid original USB/receiver state report releases outputs and resumes
+  scanning, including if a receiver continues sending status chatter. This timeout assumes
   the requested raw IMU stream is running and requires hardware verification.
 - This remains one active controller at a time. No multi-controller routing,
   pairing service, or firmware changes are included.
@@ -119,12 +149,17 @@ cannot activate it without a right-stick touch signal.
 Input report `03` contains a segment header and 18 payload bytes: exactly 20
 bytes per hidraw read. The low three header bits are the segment index, `80`
 marks data, and `40` marks the final segment. Compact state type `4` starts with
-a two-byte chunk mask; status type `5` does not activate or refresh input.
+a two-byte chunk mask. A complete 20-byte `03 c0 05` status report or
+`03 c0 04 00` empty-state report refreshes link liveness only after a state report
+has activated the controller. Neither report activates a controller, processes
+shortcuts, changes retained input, or refreshes gyro samples. Status payload is
+opaque; unrecognized upper type bits, partial/continuation status, and invalid
+transport headers cannot renew liveness.
 
 The adapter supports all nine documented optional chunks: primary buttons,
 triggers, extended buttons, stick, left/right pads, acceleration, gyro, and
 quaternion. It validates the entire mask and exact required segment count before
-committing any state. Unknown chunks/types, empty masks, short/oversized reports,
+committing any state. Unknown chunks/types, short/oversized reports,
 reserved segment-header bits, missing/out-of-order/duplicate continuations, and
 incorrect final flags are rejected. Known extended buttons and quaternion are
 consumed but do not create controls or motion absent from Orbit's original
@@ -134,6 +169,16 @@ Omitted chunks retain the last accepted values. BLE has separate stick and pad
 chunks, so it does not use USB's coordinate multiplexing. Both-grip shortcuts,
 normal gamepad/pad behavior, signed-axis bounds, trigger scaling, gyro orientation,
 and haptic pulse conversion use the same original-controller adapter.
+
+A passive original-controller BLE capture stayed connected for 20.307 seconds
+while emitting 16 single-segment status reports and no nonempty state reports
+(maximum observed nonempty-state gap: 20.07 seconds). This disproves the earlier
+assumption that an idle BLE controller must keep sending state within two seconds.
+Recognized idle heartbeats therefore extend BLE link liveness. This change is
+limited to Bluetooth-bus original IDs `1105`/`1106`; receiver `1142` status does
+not establish that its controller remains connected. Host tests verify the fix;
+the deployment smoke below also checks idle stability. Physical gameplay
+acceptance remains pending.
 
 Assembly has a 250 ms deadline measured from its first segment; empty poll
 messages cannot extend it. A fresh segment zero replaces an incomplete frame.
@@ -150,10 +195,10 @@ updates cannot integrate an old rate again. Acceleration is retained separately,
 and at least one real acceleration chunk is required before calibration or gyro
 output. After 250 ms without a gyro chunk, the driver clears gyro assistance and
 emits released stick assistance even if other chunks continue. It retains normal
-buttons/axes until release, read failure, or the existing two-second state-stream
-timeout. Receive-time integration retains the existing 1–16 ms clamp and 9 ms
-initial sample interval; queued delivery still requires physical validation.
-Disconnect/read failure and state timeout clear the assembler, retained state,
+buttons/axes until release, read failure, or two seconds without a valid state
+or recognized idle heartbeat. Receive-time integration retains the existing
+1–16 ms clamp and 9 ms initial sample interval; queued delivery still requires physical validation.
+Disconnect/read failure and link timeout clear the assembler, retained state,
 and all virtual held outputs before scanning/reconnecting.
 
 BLE feature commands use the same `03`/20-byte segmentation. Each command starts
@@ -193,11 +238,14 @@ chunk-mask combinations (including every segment boundary), atomic rejection,
 new-first-frame restart, retained state, gyro-only freshness/calibration/output,
 stale stick-assistance release, discovery by bus and ID, feature commands of
 lengths 1–64, failed/short writes at each segment, configuration/haptic bytes,
-and disconnect/reconnect with continuing status chatter. The synthetic all-mask
-fixtures remain intact. A separate regression uses real original BLE accel+gyro
+and disconnect/reconnect. Production-loop tests hold gameplay buttons and the
+existing both-grips shortcut through 4.5 seconds of status/empty-state traffic,
+verify independent gyro expiry and read-error release, and reject heartbeat-only
+activation and malformed heartbeat liveness. Receiver status still times out.
+The synthetic all-mask fixtures remain intact. A separate regression uses real original BLE accel+gyro
 (`0c00`), accel-only (`0400`), and empty-mask (`0000`) segments, asserting signed
 sensor values, retained gyro values without resampling, fresh-sample sequence
-advancement, and no state/liveness refresh from empty-mask traffic. Their replay
+advancement, and no input/gyro-state refresh from empty-mask traffic. Their replay
 order and host-test timing are controlled, not a reconstruction of capture timing.
 The newer fixture is a real 54-byte USB
 `42` report captured before this change, not an original-controller capture.
@@ -281,3 +329,13 @@ SDL's implementation is not copied or represented as SC-Orbit's own code;
 credit belongs to SDL's contributors for this protocol reference. Linux's
 [UHID feature-report path](https://github.com/torvalds/linux/blob/master/drivers/hid/uhid.c)
 was also checked for its successful write-count return convention.
+
+## BLE spinner-range deployment smoke (2026-10-11)
+
+Installed the 1.02 preview on the paired original BLE controller while Arkanoid
+(`jtkiwi.rbf`) remained running. Raw-stream activation followed start by 26.15 s;
+a 30.03 s idle observation then recorded no disconnect or inactive-interface
+messages. All four virtual devices were present, and settings, startup, input-map,
+and core-process state were preserved. This did not exercise spinner motion,
+sensitivity, gyro, or haptics. The core-owned `SteamController Mouse` continued
+to report targeted-grab warnings; those remain unresolved.

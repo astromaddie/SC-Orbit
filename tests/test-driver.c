@@ -16,6 +16,11 @@ static int event_count;
 static u8 input_queue[8][64];
 static int input_lengths[8];
 static int queue_count,queue_pos,queue_enabled,disconnect_after_queue,repeat_status;
+static u32 disconnect_at_ms;
+static struct gamepad_out_state before_disconnect_gos;
+static struct original_state before_disconnect_original;
+static struct ble_state before_disconnect_ble;
+static int before_disconnect_tuning,before_disconnect_gyro_reports;
 
 static long test_syscall(long n,long a,long b,long c){
     if(n==SYS_clock_gettime){struct timespec32 *t=(void *)b;t->tv_sec=clock_ms/1000;t->tv_nsec=(clock_ms%1000)*1000000;return 0;}
@@ -24,6 +29,11 @@ static long test_syscall(long n,long a,long b,long c){
     if(n==SYS_close)return 0;
     if(n==SYS_read){
         if(queue_enabled&&a==7){
+            if(disconnect_at_ms&&clock_ms>=disconnect_at_ms){
+                before_disconnect_gos=gos;before_disconnect_original=original;before_disconnect_ble=ble;
+                before_disconnect_tuning=tuning_prev;before_disconnect_gyro_reports=gyro.fresh_reports;
+                return -19;
+            }
             if(queue_pos<queue_count){int length=input_lengths[queue_pos]?input_lengths[queue_pos]:64;memcpy((void *)b,input_queue[queue_pos++],length);clock_ms+=9;return length;}
             if(disconnect_after_queue)return -19;
             if(repeat_status){int length=input_lengths[queue_count-1]?input_lengths[queue_count-1]:64;memcpy((void *)b,input_queue[queue_count-1],length);clock_ms+=9;return length;}
@@ -56,7 +66,7 @@ static void reset(u16 product){
     trackball_click_prev=0;trackball_click_button=TRACKBALL_CLICK_NONE;
     numpad_key_down=numpad_click_prev=numpad_rearm=0;
     feature_count=output_count=feature_fail_at=feature_fail_code=discover_enabled=0;memset(input_lengths,0,sizeof(input_lengths));queue_enabled=queue_count=queue_pos=disconnect_after_queue=repeat_status=0;
-    clock_ms=100000;
+    disconnect_at_ms=0;clock_ms=100000;
 }
 static void packet(u8 *b,u32 seq){memset(b,0,64);b[0]=1;b[2]=1;b[3]=60;put32(b+4,seq);}
 static int feed(u8 *b,int n){clock_ms+=9;return process_input_report(7,10,11,12,13,b,n);}
@@ -336,8 +346,10 @@ static void test_ble_rejection_and_restart(void){
     feed(seg[0],20);feed(seg[1],20);memcpy(bad,seg[2],20);bad[1]&=~0x40;assert_ble_rejected(bad,20);
     memcpy(bad,seg[0],20);bad[1]|=8;assert_ble_rejected(bad,20); /* reserved header */
     memcpy(bad,seg[0],20);bad[2]=4;bad[3]=0x20;assert_ble_rejected(bad,20); /* unknown mask */
-    bad[1]=0xc0;bad[3]=0;assert_ble_rejected(bad,20); /* empty mask */
-    bad[2]=5;assert_ble_rejected(bad,20); /* status */
+    bad[1]=0x80;bad[3]=0;assert_ble_rejected(bad,20); /* non-final empty mask */
+    bad[2]=5;assert_ble_rejected(bad,20); /* non-final status */
+    bad[1]=0xc1;assert_ble_rejected(bad,20); /* status continuation */
+    bad[1]=0xc0;
     bad[2]=6;assert_ble_rejected(bad,20); /* unknown type */
     /* Empty polling messages leave a valid in-progress frame intact. */
     feed(seg[0],20);memset(bad,0,20);bad[0]=3;assert_ble_rejected(bad,20);
@@ -398,19 +410,13 @@ static void test_captured_original_ble_sensors(void){
     assert(le16s(original.report+40)==-2&&le16s(original.report+42)==1&&le16s(original.report+44)==-5);
     assert(!ble.gyro_fresh&&ble.imu_sequence==1&&gyro.fresh_reports==1&&ble.last_gyro_ms==gyro_time);
     before=original;before_ble=ble;count=event_count;
-    assert(feed(captured[2],20)==REPORT_IGNORED);
+    assert(feed(captured[2],20)==REPORT_HEARTBEAT);
     assert(!memcmp(&before,&original,sizeof(original))&&!memcmp(&before_ble,&ble,sizeof(ble)));
     assert(event_count==count&&gyro.fresh_reports==1);
     assert(feed(captured[3],20)==REPORT_STATE);
     assert(gyro.prev_ax==640&&gyro.prev_ay==-1768&&gyro.prev_az==16229);
     assert(gyro.prev_gx==-5&&gyro.prev_gy==1&&gyro.prev_gz==-6);
     assert(ble.gyro_fresh&&ble.imu_sequence==2&&gyro.fresh_reports==2&&ble.last_gyro_ms>gyro_time);
-    /* Actual empty-mask traffic cannot renew the production loop's liveness. */
-    reset_ble();active_product=PRODUCT_SC_BLE2;
-    memcpy(input_queue[0],captured[0],20);memcpy(input_queue[1],captured[2],20);
-    input_lengths[0]=input_lengths[1]=20;queue_count=2;queue_enabled=repeat_status=1;
-    assert(run_controller(7,10,11,12,13)==-1&&clock_ms>=102000);
-    assert(!original.connected&&!ble.gyro_ready&&gyro.fresh_reports==1);
 }
 static void test_ble_features(void){
     u8 command[64];int n,i,j,segments;
@@ -446,7 +452,7 @@ static void test_ble_disconnect_loop(void){
     u8 p[54],seg[20];int n;
     reset_ble();n=ble_fixture(p,0x10);p[2]=128;p[3]=p[4]=0;
     ble_segment(seg,p,n,0);memcpy(input_queue[0],seg,20);input_lengths[0]=20;
-    memset(input_queue[1],0,20);input_queue[1][0]=3;input_queue[1][1]=0xc0;input_queue[1][2]=5;input_lengths[1]=20;
+    memset(input_queue[1],0,20);input_queue[1][0]=3;input_queue[1][1]=0xc0;input_queue[1][2]=6;input_lengths[1]=20; /* unknown traffic cannot keep input alive */
     queue_enabled=repeat_status=1;queue_count=2;
     assert(run_controller(7,10,11,12,13)==-1&&!gos.a&&!ble.gyro_ready&&!ble_assembly.expected);
     assert(has_event(EV_KEY,BTN_SOUTH,1)&&has_event(EV_KEY,BTN_SOUTH,0));
@@ -457,10 +463,119 @@ static void test_ble_disconnect_loop(void){
     queue_count=queue_enabled=disconnect_after_queue=1;
     assert(run_controller(7,10,11,12,13)==-1&&!gos.a&&!original.connected);
 }
+
+static void test_ble_idle_heartbeats(void){
+    u8 p[54],seg[20],beat[20]={3,0xc0,4,0};int n,kind,chord,bad;
+    struct original_state expected;
+    for(kind=0;kind<2;kind++)for(chord=0;chord<2;chord++){
+        reset_ble();beat[2]=kind?5:4;
+        /* A real input followed only by idle traffic for >two seconds. Use
+         * both a gameplay hold and the existing grips+Y shortcut hold. */
+        n=ble_fixture(p,0xc10);p[2]=chord?16:128;p[3]=chord?128:0;p[4]=chord?1:0;
+        assert(ble_feed_payload(p,n)==REPORT_STATE);expected=original;
+        reset_ble();ble_segment(seg,p,n,0);memcpy(input_queue[0],seg,20);
+        memcpy(input_queue[1],beat,20);input_lengths[0]=input_lengths[1]=20;
+        queue_count=2;queue_enabled=repeat_status=1;disconnect_at_ms=clock_ms+4500;
+        assert(run_controller(7,10,11,12,13)==-1&&clock_ms>=disconnect_at_ms);
+        assert(!memcmp(&expected,&before_disconnect_original,sizeof(expected)));
+        assert(before_disconnect_gos.a==!chord&&before_disconnect_tuning==chord);
+        assert(cfg.spinner_direction==(chord?-1:1)); /* shortcut not replayed */
+        assert(!before_disconnect_ble.gyro_ready&&before_disconnect_gyro_reports==1);
+        assert(before_disconnect_ble.imu_sequence==1); /* link beats aren't IMU */
+        assert(!gos.a&&!original.connected&&!ble.gyro_ready&&!tuning_prev);
+        if(!chord)assert(has_event(EV_KEY,BTN_SOUTH,1)&&has_event(EV_KEY,BTN_SOUTH,0));
+        /* Heartbeat-only interfaces do not activate or create gamepad output. */
+        reset_ble();memcpy(input_queue[0],beat,20);input_lengths[0]=20;
+        queue_count=queue_enabled=repeat_status=1;
+        assert(run_controller(7,10,11,12,13)==-2&&!original.connected&&!event_count);
+    }
+    /* Transport validation is required even when the low nibble says status.
+     * A held button must expire under short, reserved, partial, continuation,
+     * non-data, unknown-type, and unknown-mask traffic. */
+    for(bad=0;bad<8;bad++){
+        reset_ble();n=ble_fixture(p,0x10);p[2]=128;p[3]=p[4]=0;
+        ble_segment(input_queue[0],p,n,0);input_lengths[0]=20;
+        memset(beat,0,20);beat[0]=3;beat[1]=0xc0;beat[2]=5;
+        if(bad==1)beat[1]|=8;
+        if(bad==2)beat[1]=0x80;
+        if(bad==3)beat[1]=0xc1;
+        if(bad==4)beat[1]=0x40;
+        if(bad==5)beat[2]=6;
+        if(bad==6){beat[2]=4;beat[3]=0x20;}
+        if(bad==7)beat[2]=0x15; /* unknown status flags */
+        memcpy(input_queue[1],beat,20);input_lengths[1]=bad?20:19;
+        queue_count=2;queue_enabled=repeat_status=1;
+        assert(run_controller(7,10,11,12,13)==-1&&clock_ms>=102000&&clock_ms<103000);
+        assert(!gos.a&&!original.connected&&has_event(EV_KEY,BTN_SOUTH,0));
+    }
+}
+
+/* Prescribed physical-coordinate motion, through decode and EV_REL output.
+ * One 24000-radius revolution in32 equal steps; or32768 horizontal units in
+ *64 steps. Reports are9ms apart. No formula duplicates spinner implementation. */
+static void spinner_input(u16 product,int grips,int shoulder,int touch,int x,int y){
+    u8 b[64];
+    if(!original_controller()){
+        memset(b,0,64);b[0]=product==PRODUCT_BT?0x45:(product==PRODUCT_PUCK?0x47:0x42);if(grips)b[2]=16;
+        if(shoulder<0)b[4]=8;if(shoulder>0)b[3]=2;
+        if(touch)b[5]=2;put16(b+18,x);put16(b+20,y);feed(b,54);
+    }else if(original_ble()){
+        u8 p[9]={0x14,1,0,0,0,0,0,0,0};
+        if(grips){p[3]=128;p[4]=1;}if(shoulder<0)p[2]=8;if(shoulder>0)p[2]=4;
+        if(touch)p[4]|=8;put16(p+5,x);put16(p+7,y);ble_feed_payload(p,9);
+    }else{
+        packet(b,clock_ms);if(grips){b[9]=128;b[10]=1;}
+        if(shoulder<0)b[8]=8;if(shoulder>0)b[8]=4;
+        if(touch)b[10]|=8;put16(b+16,x);put16(b+18,y);feed(b,64);
+    }
+}
+static int measure_spinner(u16 product,int mode,int level,int small){
+    static const s16 circle[32][2]={{24000,0},{23539,4682},{22173,9184},{19955,13334},{16971,16971},{13334,19955},{9184,22173},{4682,23539},{0,24000},{-4682,23539},{-9184,22173},{-13334,19955},{-16971,16971},{-19955,13334},{-22173,9184},{-23539,4682},{-24000,0},{-23539,-4682},{-22173,-9184},{-19955,-13334},{-16971,-16971},{-13334,-19955},{-9184,-22173},{-4682,-23539},{0,-24000},{4682,-23539},{9184,-22173},{13334,-19955},{16971,-16971},{19955,-13334},{22173,-9184},{23539,-4682}};
+    int i,sum=0,other,dir=level<6?-1:1;
+    reset(product);if(product==PRODUCT_SC_BLE||product==PRODUCT_SC_BLE2)active_bus=BUS_BLUETOOTH;
+    cfg.spinner_mode=mode;other=mode?cfg.spinner_ipod_speed:cfg.spinner_x_speed;
+    for(i=6;i!=level;i+=dir){
+        spinner_input(product,1,0,0,0,0);spinner_input(product,1,dir,0,0,0);
+        assert(active_spinner_speed()==i+dir);
+        spinner_input(product,1,dir,0,0,0);assert(active_spinner_speed()==i+dir);
+    }
+    if(level==1||level==10){
+        spinner_input(product,1,0,0,0,0);spinner_input(product,1,dir,0,0,0);
+        assert(active_spinner_speed()==level); /* clamps at both endpoints */
+    }
+    assert((mode?cfg.spinner_ipod_speed:cfg.spinner_x_speed)==other);
+    spinner_input(product,0,0,0,0,0);assert(!post_tune_block&&!tuning_prev);
+    event_count=0;
+    if(mode){for(i=0;i<=(small?256:64);i++){
+        spinner_input(product,0,0,1,-16384+i*(small?32:512),12000);
+        if(small&&i==1)assert(!has_event(EV_REL,REL_DIAL,1)); /* first tiny step is fractional */
+    }}
+    else{for(i=0;i<=32;i++)spinner_input(product,0,0,1,circle[i%32][0],circle[i%32][1]);}
+    for(i=0;i<event_count;i++)if(events[i].type==EV_REL&&events[i].code==REL_DIAL)sum+=events[i].value;
+    return iabs32(sum);
+}
+static void test_spinner_speed_path(void){
+    static const u16 products[]={PRODUCT_SC_WIRED,PRODUCT_SC_WIRELESS,PRODUCT_SC_BLE,PRODUCT_SC_BLE2,PRODUCT_WIRED,PRODUCT_BT,PRODUCT_PUCK};
+    /* Observed baseline/candidate EV_REL counts, including quantization. */
+    static const int expected[2][2][10]={
+        {{6,12,24,42,68,103,123,146,174,208},{11,23,43,71,111,169,198,233,272,322}},
+        {{30,42,56,70,86,103,123,146,174,208},{59,79,101,124,146,169,198,233,272,322}}
+    };
+    int p,mode,level,count,previous;
+    for(p=0;p<7;p++)for(mode=0;mode<2;mode++){
+        previous=0;
+        for(level=1;level<=10;level++){
+            count=measure_spinner(products[p],mode,level,0);
+            assert(count>previous);previous=count;
+            assert(count==expected[p>=4][mode][level-1]);
+        }
+        if(mode)assert(measure_spinner(products[p],mode,1,1)==(p>=4?13:2)); /*256 tiny steps accumulate*/
+    }
+}
 int main(void){
-    test_buttons_axes();test_stick_event_bounds();test_multiplex_and_touch();test_imu();test_shortcuts();
+    test_spinner_speed_path();test_buttons_axes();test_stick_event_bounds();test_multiplex_and_touch();test_imu();test_shortcuts();
     test_haptics_features();test_newer();test_rejection_disconnect();
     test_ble_discovery();test_ble_all_chunk_boundaries();test_ble_retention_shortcuts();
-    test_ble_rejection_and_restart();test_ble_gyro_freshness();test_captured_original_ble_sensors();test_ble_features();test_ble_disconnect_loop();
+    test_ble_rejection_and_restart();test_ble_gyro_freshness();test_captured_original_ble_sensors();test_ble_features();test_ble_disconnect_loop();test_ble_idle_heartbeats();
     puts("PASS: production USB/receiver/BLE/newer input, outputs, shortcuts, IMU, haptics and disconnect loop");return 0;
 }
