@@ -16,7 +16,9 @@ typedef signed int         s32;
 typedef unsigned long      usize;
 typedef signed long        ssize;
 
+#ifndef NULL
 #define NULL ((void*)0)
+#endif
 
 /* Short asynchronous haptic songs for mode and action feedback.
  *
@@ -173,6 +175,13 @@ static const struct voice_phrase_def voice_phrases[VOICE_PHRASE_COUNT]={
 #undef MF
 
 
+/* Host tests replace only the operating-system boundary. */
+#ifdef SC_ORBIT_TEST
+static long test_syscall(long n,long a,long b,long c);
+static inline long sc1(long n,long a){return test_syscall(n,a,0,0);}
+static inline long sc2(long n,long a,long b){return test_syscall(n,a,b,0);}
+static inline long sc3(long n,long a,long b,long c){return test_syscall(n,a,b,c);}
+#else
 /* ARM EABI Linux syscalls. */
 static inline long sc1(long n, long a) {
     register long r7 __asm__("r7") = n;
@@ -195,6 +204,8 @@ static inline long sc3(long n, long a, long b, long c) {
     __asm__ volatile("svc 0" : "+r"(r0) : "r"(r1), "r"(r2), "r"(r7) : "memory", "cc");
     return r0;
 }
+
+#endif
 
 #define SYS_exit       1
 #define SYS_read       3
@@ -220,12 +231,14 @@ static void sleep_ms(u32 ms) {
 }
 static void xexit(int code) { sc1(SYS_exit,code); for(;;){} }
 
+#ifndef SC_ORBIT_TEST
 void *memset(void *dst, int c, usize n) {
     u8 *d=(u8*)dst; while(n){ *d++=(u8)c; n--; } return dst;
 }
 void *memcpy(void *dst, const void *src, usize n) {
     u8 *d=(u8*)dst; const u8 *s=(const u8*)src; while(n){ *d++=*s++; n--; } return dst;
 }
+#endif
 static usize slen(const char *s) { usize n=0; while(s[n]) n++; return n; }
 static int streq_n(const char *a,const char *b,usize n) { usize i=0; while(i<n){ if(a[i]!=b[i]) return 0; i++; } return 1; }
 static void log_text(const char *s) { xwrite(1,s,(u32)slen(s)); }
@@ -699,26 +712,27 @@ static int find_hidraw(void){
     }
     return -1;
 }
+static int original_controller(void){return active_product==PRODUCT_SC_WIRED||active_product==PRODUCT_SC_WIRELESS;}
 static int feature_report_id(void){
     return (active_product==PRODUCT_WIRED||active_product==PRODUCT_BT||active_product==PRODUCT_PUCK)?1:0;
 }
 static int send_feature_cmd_id(int fd,int report_id,const u8 *cmd,int n){
-    u8 b[64];int i,tries,rc=-1;
+    u8 b[65];int i,tries,rc=-1,size=original_controller()?65:64;
     for(tries=0;tries<50;tries++){
         memset(b,0,sizeof(b));b[0]=(u8)report_id;
-        for(i=0;i<n&&i+1<(int)sizeof(b);i++)b[i+1]=cmd[i];
-        rc=(int)xioctl(fd,HIDIOCSFEATURE(64),b);
+        for(i=0;i<n&&i+1<size;i++)b[i+1]=cmd[i];
+        rc=(int)xioctl(fd,HIDIOCSFEATURE(size),b);
         if(rc>=0)return rc;
         if(rc!=-EPIPE)break;
         memset(b,0,sizeof(b));b[0]=(u8)report_id;
-        xioctl(fd,HIDIOCGFEATURE(64),b);sleep_ms(20);
+        xioctl(fd,HIDIOCGFEATURE(size),b);sleep_ms(20);
     }
     return rc;
 }
 static int send_feature_cmd(int fd,const u8 *cmd,int n){
     int preferred=feature_report_id(),rc;
     rc=send_feature_cmd_id(fd,preferred,cmd,n);
-    if(rc<0)rc=send_feature_cmd_id(fd,preferred?0:1,cmd,n);
+    if(rc<0&&!original_controller())rc=send_feature_cmd_id(fd,preferred?0:1,cmd,n);
     return rc;
 }
 static int configure_controller(int fd){
@@ -803,10 +817,30 @@ static int scan_targeted_physical_events(void){
  * press remains silent because change_level() returns before calling it.
  * ------------------------------------------------------------------------- */
 static int voice_busy,voice_rendering;
+/* Original firmware has two pulse actuators, no 0x83 tone/rear channels.
+ * Translate pitch to a pulse period and bound every command's lifetime. */
+static int original_haptic_command(u8 *r,u8 channel,s8 gain,u16 freq,u16 dur){
+    u32 period,on,count;int i;
+    if(channel>1)return 0;
+    for(i=0;i<10;i++)r[i]=0;
+    r[0]=0x8f;r[1]=8;r[2]=channel^1;
+    if(freq&&dur){
+        period=udiv32(1000000U,clamp32(freq,20,2000));
+        on=period/2;count=udiv32((u32)clamp32(dur,1,1000)*1000U+period-1,period);
+        r[3]=(u8)on;r[4]=(u8)(on>>8);
+        r[5]=(u8)(period-on);r[6]=(u8)((period-on)>>8);
+        r[7]=(u8)count;r[8]=(u8)(count>>8);
+    }
+    r[9]=(u8)(s8)clamp32(gain,-24,6);return 10;
+}
+static void original_haptic(int hid,u8 channel,s8 gain,u16 freq,u16 dur){
+    u8 r[10];if(original_haptic_command(r,channel,gain,freq,dur))send_feature_cmd(hid,r,10);
+}
 static void haptic_tone_raw(int hid,u8 channel,s8 gain,u16 freq,u16 dur,u16 lfo,u8 depth){
     if(voice_busy&&!voice_rendering)return;
     u8 r[10];
     if(hid<0)return;
+    if(original_controller()){original_haptic(hid,channel,gain,freq,dur);return;}
     r[0]=0x83;r[1]=channel;r[2]=(u8)gain;
     r[3]=(u8)freq;r[4]=(u8)(freq>>8);
     r[5]=(u8)dur;r[6]=(u8)(dur>>8);
@@ -893,6 +927,7 @@ struct voice_runtime {
 static struct voice_runtime voice_rt;
 static void voice_stop_channel(int hid,u8 channel){
     u8 r[10];if(hid<0)return;memset(r,0,sizeof(r));
+    if(original_controller()){original_haptic(hid,channel,0,0,0);return;}
     r[0]=0x83;r[1]=channel;r[2]=0x80;r[6]=0x80;xwrite(hid,r,10);
 }
 static void voice_stop_all(int hid){
@@ -909,6 +944,7 @@ static s8 voice_scaled_gain(s8 gain,u8 channel){
 }
 static void voice_tone(int hid,u8 channel,s8 gain,u16 freq){
     u8 r[10];if(hid<0||!freq||gain<=-120)return;memset(r,0,sizeof(r));
+    if(original_controller()){original_haptic(hid,channel,voice_scaled_gain(gain,channel),freq,VOICE_SUBFRAME_MS);return;}
     r[0]=0x83;r[1]=channel;r[2]=(u8)voice_scaled_gain(gain,channel);
     r[3]=(u8)freq;r[4]=(u8)(freq>>8);r[5]=0xff;r[6]=0x7f;xwrite(hid,r,10);
 }
@@ -1041,6 +1077,73 @@ static u16 le16u(const u8 *p){return (u16)((u16)p[0]|((u16)p[1]<<8));}
 static u32 le32u(const u8 *p){return (u32)p[0]|((u32)p[1]<<8)|((u32)p[2]<<16)|((u32)p[3]<<24);}
 static s32 consume_q16(s32 *acc);
 static s32 mul_scale_q8(s32 v,s32 q8);
+
+
+/* Original USB/Valve-receiver protocol facts are documented in COMPATIBILITY.md.
+ * Independently implemented adapter: the processing engine still consumes its
+ * existing 2026 layout. The untouched surface survives alternating reports. */
+enum report_result {REPORT_IGNORED,REPORT_STATE,REPORT_DISCONNECTED,REPORT_CONNECTED};
+struct original_state {int connected;s16 stick_x,stick_y,pad_x,pad_y;u8 report[54];};
+static struct original_state original;
+static void put16(u8 *p,u16 v){p[0]=(u8)v;p[1]=(u8)(v>>8);}
+static void put32(u8 *p,u32 v){p[0]=(u8)v;p[1]=(u8)(v>>8);p[2]=(u8)(v>>16);p[3]=(u8)(v>>24);}
+static int decode_report(u16 product,struct original_state *state,const u8 *raw,int n,const u8 **out,int *out_n){
+    int pad,mixed,tuning,i;u8 *b=state->report;
+    *out=0;*out_n=0;
+    if(product!=PRODUCT_SC_WIRED&&product!=PRODUCT_SC_WIRELESS){
+        /* Preserve the existing newer USB/BT/puck report path byte-for-byte. */
+        if(n>=28&&(raw[0]==0x42||raw[0]==0x45||raw[0]==0x47)){*out=raw;*out_n=n;return REPORT_STATE;}
+        return REPORT_IGNORED;
+    }
+    if(n!=64||raw[0]!=1||raw[1]!=0)return REPORT_IGNORED;
+    if(raw[2]==3&&raw[3]==1&&(raw[4]==1||raw[4]==2)){
+        if(raw[4]==2&&state->connected)return REPORT_IGNORED;
+        memset(state,0,sizeof(*state));state->connected=raw[4]==2;
+        return raw[4]==1?REPORT_DISCONNECTED:REPORT_CONNECTED;
+    }
+    if(raw[2]!=1||raw[3]!=60)return REPORT_IGNORED;
+    state->connected=1;
+    pad=(raw[10]&8)!=0;mixed=(raw[10]&128)!=0;
+    if(pad){state->pad_x=le16s(raw+16);state->pad_y=le16s(raw+18);if(!mixed)state->stick_x=state->stick_y=0;}
+    else{state->stick_x=le16s(raw+16);state->stick_y=le16s(raw+18);if(!mixed)state->pad_x=state->pad_y=0;}
+    memset(b,0,54);b[0]=0x42;b[1]=raw[4];
+    if(raw[8]&128)b[2]|=1; if(raw[8]&32)b[2]|=2;
+    if(raw[8]&64)b[2]|=4; if(raw[8]&16)b[2]|=8;
+    if(raw[9]&64)b[2]|=64; if(raw[10]&1)b[2]|=128;
+    if(raw[8]&4)b[3]|=2; if(raw[9]&8)b[3]|=4;
+    if(raw[9]&2)b[3]|=8; if(raw[9]&4)b[3]|=16;
+    if(raw[9]&1)b[3]|=32; if(raw[9]&16)b[3]|=64;
+    if(raw[10]&64)b[3]|=128;
+    if(raw[9]&32)b[4]|=1; if(raw[9]&128)b[4]|=2;
+    if(raw[8]&8)b[4]|=8; if(raw[10]&16)b[4]|=32;
+    if(raw[10]&4)b[4]|=64; if(raw[8]&1)b[4]|=128;
+    /* Original stick has no capacitive touch sensor. Click is its gyro clutch. */
+    if(raw[10]&64)b[5]|=1;
+    if(pad||mixed)b[5]|=2;
+    if(raw[10]&2)b[5]|=4; if(raw[8]&2)b[5]|=8;
+    tuning=(raw[9]&128)&&(raw[10]&1);
+    if(tuning){
+        b[2]|=16; /* Both grips replace the missing quick-access button. */
+        b[2]&=~128;b[4]&=~2; /* Grips themselves never trigger gyro actions. */
+        /* Stick directions provide settings arrows independently of pad mode. */
+        if(state->stick_x < -16000)b[3]|=16;
+        if(state->stick_x > 16000)b[3]|=8;
+        if(state->stick_y < -16000)b[3]|=4;
+        if(state->stick_y > 16000)b[3]|=32;
+    }
+    put16(b+6,(u16)udiv32((u32)raw[11]*32767U,255));
+    put16(b+8,(u16)udiv32((u32)raw[12]*32767U,255));
+    put16(b+10,(u16)state->stick_x);put16(b+12,(u16)state->stick_y);
+    put16(b+18,(u16)state->pad_x);put16(b+20,(u16)state->pad_y);
+    for(i=0;i<4;i++)b[24+i]=raw[20+i];
+    /* Original sends a sequence counter, not a microsecond clock. Preserve it
+     * for duplicate detection; gyro_fresh_dt uses elapsed host time instead. */
+    put32(b+30,le32u(raw+4));
+    for(i=0;i<12;i++)b[34+i]=raw[28+i];
+    /* Original gyro Y has the opposite raw sign to the newer controller. */
+    put16(b+42,(u16)(s16)clamp32(-((s32)le16s(raw+36)),-32768,32767));
+    *out=b;*out_n=54;return REPORT_STATE;
+}
 
 /* -------------------------------------------------------------------------
  * Touch-clutched player-space gyro engine.
@@ -1304,8 +1407,17 @@ static void gyro_toggle(int hid){
     gyro.enabled=!gyro.enabled;cfg.gyro_enabled=gyro.enabled;save_cfg();gyro_reset_motion();gyro_reset_rest_window();gyro_toggle_cue(hid,gyro.enabled);
     log_text(gyro.enabled?"SC-Orbit gyro: MASTER ENABLED\n":"SC-Orbit gyro: MASTER DISABLED - all gyro outputs blocked\n");
 }
+static u32 original_gyro_ms;
 static int gyro_fresh_dt(const u8 *b,int n,s32 *dt_us){
-    u32 d;int kind;if(n<46)return 0;kind=b[0]==0x47?1:2;
+    u32 d;int kind;if(n<46)return 0;kind=original_controller()?3:(b[0]==0x47?1:2);
+    if(kind==3){
+        u32 seq=le32u(b+30),now=monotonic_ms();
+        if(gyro.timestamp_ready&&gyro.timestamp_kind==kind&&seq==gyro.last_ts32){gyro.duplicate_reports++;return 0;}
+        d=(gyro.timestamp_ready&&gyro.timestamp_kind==kind)?(u32)(now-original_gyro_ms)*1000U:9000U;
+        original_gyro_ms=now;if(d<1000U)d=1000U;if(d>16000U)d=16000U;
+        gyro.last_ts32=seq;gyro.timestamp_ready=1;gyro.timestamp_kind=kind;
+        *dt_us=(s32)d;gyro.imu_changes++;return 1;
+    }
     if(kind==1){u16 t=le16u(b+32);if(!gyro.timestamp_ready||gyro.timestamp_kind!=kind){gyro.last_ts16=t;gyro.timestamp_ready=1;gyro.timestamp_kind=kind;*dt_us=GYRO_NOMINAL_DT_US;gyro.imu_changes++;return 1;}d=(u32)(u16)(t-gyro.last_ts16)*32u;if(!d){gyro.duplicate_reports++;return 0;}gyro.last_ts16=t;}
     else{u32 t=le32u(b+30);if(!gyro.timestamp_ready||gyro.timestamp_kind!=kind){gyro.last_ts32=t;gyro.timestamp_ready=1;gyro.timestamp_kind=kind;*dt_us=GYRO_NOMINAL_DT_US;gyro.imu_changes++;return 1;}d=t-gyro.last_ts32;if(!d){gyro.duplicate_reports++;return 0;}gyro.last_ts32=t;}
     gyro.imu_changes++;if(d<1000u)d=1000u;if(d>16000u)d=16000u;*dt_us=(s32)d;return 1;
@@ -2160,7 +2272,7 @@ struct gamepad_out_state{
 };
 static struct gamepad_out_state gos;static int gp_dirty,gp_batch_count;
 static struct input_event gp_batch[32];
-static s32 clean_stick(s32 v){return iabs32(v)<1800?0:v;}
+static s32 clean_stick(s32 v){return iabs32(v)<1800?0:clamp32(v,-32767,32767);}
 static void queue_gamepad(u16 type,u16 code,s32 value){
     struct input_event *e;if(gp_batch_count>=32)return;e=&gp_batch[gp_batch_count++];memset(e,0,sizeof(*e));e->type=type;e->code=code;e->value=value;
 }
@@ -2205,7 +2317,7 @@ static void neutralize_gamepad(int gp){memset(&gos,0,sizeof(gos));gos.valid=0;em
 
 static u32 prev_shortcuts;static int tuning_prev,post_tune_block;
 static int shortcut_controls_down(const u8 *b){
-    return (b[2]&(1|2|4|8|32|64|128))||(b[3]&(1|2|4|8|16|32|64|128))||(b[4]&(1|2|4|8|64|128))||(b[5]&(4|8));
+    return (original_controller()&&(iabs32(le16s(b+10))>16000||iabs32(le16s(b+12))>16000))||(b[2]&(1|2|4|8|32|64|128))||(b[3]&(1|2|4|8|16|32|64|128))||(b[4]&(1|2|4|8|64|128))||(b[5]&(4|8));
 }
 static void process_report(int hid,int gp,int mouse,int spinner,int keypad,const u8 *b,int n){
     int ltouch,rtouch,lclick,rclick,left_stick_touch,right_stick_touch,tuning,suppress;
@@ -2247,6 +2359,19 @@ static void process_report(int hid,int gp,int mouse,int spinner,int keypad,const
     if(b[2]&64)s|=1u<<20;  /* Start: save complete user profile */
     if(b[3]&64)s|=1u<<21;  /* Select: load complete user profile */
     if(b[4]&1)s|=1u<<22;   /* Steam menu: restore defaults */
+    if(original_controller()){
+        /* Stick-click layer: Y master, X inversion, shoulders sensitivity,
+         * A arms left-stick assistance. No physical right stick exists. */
+        s&=~((1u<<15)|(1u<<17)|(1u<<19));
+        if(tuning&&(b[3]&128)){
+            s=0;
+            if(b[2]&8)s|=1u<<14;
+            if(b[2]&4)s|=1u<<19;
+            if(b[4]&8)s|=1u<<15;
+            if(b[3]&2)s|=1u<<16;
+            if(b[2]&1)s|=1u<<17;
+        }
+    }
     if(tuning){
         if(!tuning_prev){zero_motion();ms.spinner_rearm=spinner_touch;ms.trackball_rearm=trackball_touch;release_trackball_mouse_click(mouse);spinner_primary(spinner,0);spinner_secondary(spinner,0);release_numpad_key(keypad);}
         if((s&(1u<<0))&&!(prev_shortcuts&(1u<<0))){if(cfg.spinner_mode==0)change_level(hid,&cfg.spinner_ipod_speed,-1,spinner_haptic_channel());else change_level(hid,&cfg.spinner_x_speed,-1,spinner_haptic_channel());}
@@ -2367,10 +2492,29 @@ static void process_report(int hid,int gp,int mouse,int spinner,int keypad,const
     ms.spinner_touch_prev=(gyro_paddle_mode||cfg.numpad_enabled)?0:spinner_touch;ms.trackball_touch_prev=trackball_touch;
 }
 
+static void release_controller_outputs(int hid,int gp,int mouse,int spinner,int keypad){
+    neutralize_gamepad(gp);release_trackball_mouse_click(mouse);
+    spinner_primary(spinner,0);spinner_secondary(spinner,0);release_numpad_key(keypad);
+    voice_cancel(hid);zero_motion();memset(&ms,0,sizeof(ms));ms.trackball_source_pad=-1;gyro_reset_motion();gyro_reset_rest_window();
+    gyro.timestamp_ready=gyro.timestamp_kind=gyro.touch_prev=gyro.active_prev=0;
+    numpad_click_prev=numpad_rearm=numpad_hover_key=numpad_hover_candidate=numpad_hover_reports=0;
+    memset(&original,0,sizeof(original));prev_shortcuts=0;tuning_prev=0;post_tune_block=0;
+}
+/* This is the single production entry point exercised by the host tests. */
+static int process_input_report(int hid,int gp,int mouse,int spinner,int keypad,const u8 *raw,int n){
+    const u8 *b;int length,result;
+    result=decode_report(active_product,&original,raw,n,&b,&length);
+    if(result==REPORT_STATE)process_report(hid,gp,mouse,spinner,keypad,b,length);
+    else if(result==REPORT_DISCONNECTED||result==REPORT_CONNECTED){
+        release_controller_outputs(hid,gp,mouse,spinner,keypad);
+        original.connected=result==REPORT_CONNECTED;
+    }
+    return result;
+}
 static int run_controller(int hid,int gp,int mouse,int spinner,int keypad){
-    u8 b[128];long n;int misses=0,active=0,drained;u32 next_coast,next_rescan,next_reassert;
+    u8 b[128];long n;int misses=0,active=0,drained;u32 next_coast,next_rescan,next_reassert,last_state_ms=monotonic_ms();
     (void)configure_controller(hid);
-    gyro_defaults();
+    gyro_defaults();memset(&original,0,sizeof(original));
     memset(&voice_rt,0,sizeof(voice_rt));voice_busy=voice_rendering=0;
     memset(&ms,0,sizeof(ms));ms.trackball_source_pad=-1;memset(&gos,0,sizeof(gos));prev_shortcuts=0;tuning_prev=0;post_tune_block=0;mouse_left_state=0;mouse_right_state=0;spinner_primary_state=0;spinner_secondary_state=0;trackball_click_prev=0;trackball_click_button=TRACKBALL_CLICK_NONE;numpad_key_down=0;numpad_click_prev=0;numpad_rearm=0;numpad_hover_key=numpad_hover_candidate=numpad_hover_reports=0;
     next_coast=monotonic_ms()+4U;next_rescan=monotonic_ms()+3000U;next_reassert=monotonic_ms()+5000U;
@@ -2379,22 +2523,27 @@ static int run_controller(int hid,int gp,int mouse,int spinner,int keypad){
         for(drained=0;drained<64;drained++){
             n=xread(hid,b,sizeof(b));
             if(n>0){
-                if(n>=28&&(b[0]==0x42||b[0]==0x45||b[0]==0x47)){
-                    got=1;misses=0;
+                int result=process_input_report(hid,gp,mouse,spinner,keypad,b,(int)n);
+                if(result==REPORT_DISCONNECTED)return -1;
+                if(result==REPORT_CONNECTED){(void)configure_controller(hid);active=0;misses=0;}
+                if(result==REPORT_STATE){
+                    got=1;misses=0;last_state_ms=monotonic_ms();
                     if(!active){
                         scan_targeted_physical_events();
                         active=1;log_text("SC-Orbit: verified raw controller; targeted duplicate suppression active; virtual input remains live\n");
                     }
-                    process_report(hid,gp,mouse,spinner,keypad,b,(int)n);
                 }
                 continue;
             }
-            if(n<0&&n!=-EAGAIN){neutralize_gamepad(gp);release_trackball_mouse_click(mouse);spinner_primary(spinner,0);spinner_secondary(spinner,0);release_numpad_key(keypad);return -1;}
+            if(n<0&&n!=-EAGAIN){release_controller_outputs(hid,gp,mouse,spinner,keypad);return -1;}
             break;
         }
         if(!active){if(!got)misses++;if(misses>2000)return -2;}
         if(active){
             u32 now=monotonic_ms();
+            /* Original wireless receiver remains present when its controller
+             * vanishes. Battery/status traffic must not keep held input alive. */
+            if(original_controller()&&(u32)(now-last_state_ms)>2000U){release_controller_outputs(hid,gp,mouse,spinner,keypad);return -1;}
             if((s32)(now-next_coast)>=0){
                 int coast_steps=0;
                 while((s32)(now-next_coast)>=0&&coast_steps<3){
@@ -2423,4 +2572,6 @@ int main(void){
     return 0;
 }
 
+#ifndef SC_ORBIT_TEST
 void _start(void){xexit(main());}
+#endif

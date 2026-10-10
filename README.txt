@@ -1,6 +1,8 @@
 SC-ORBIT
 ========
 
+Original 2015 Steam Controller USB/Valve-receiver compatibility is implemented in the source. For its both-grip shortcut scheme, build instructions, supported transports, and pending physical acceptance, see COMPATIBILITY.md. The illustrated quick-access-button guide below is for the newer controller.
+
 SC-Orbit turns the Steam Controller into a controller-first input system for
 MiSTer, with fluid trackball and spinner controls, gyro aiming, a virtual
 number pad, profiles, and haptic feedback.
@@ -54,7 +56,8 @@ PROFILES / SYSTEM
   Select               Load user profile
   Steam/Menu           Restore defaults
 
-See SC-Orbit-Hotkey-Guide.png for the phone-friendly visual reference.
+The graphic hotkey guide for the newer controller is not included in this fork
+package. See COMPATIBILITY.md for original-controller controls.
 
 FILES WRITTEN TO THE SD CARD
 ----------------------------

@@ -11,3 +11,9 @@ feedback.
 
 Please preserve credit to SC-Wrapper and its contributors in redistributions or
 derivative work.
+
+The original-controller protocol adapter was independently implemented using
+hardware protocol documentation in Linux hid-steam.c. Thanks to the Linux
+hid-steam contributors for the button, multiplexed-axis, IMU, feature-report,
+and haptic-pulse protocol reference. No Linux driver implementation was copied;
+SC-Orbit remains MIT-licensed. See COMPATIBILITY.md for reference details.
