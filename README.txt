@@ -1,7 +1,7 @@
 SC-ORBIT
 ========
 
-Original 2015 Steam Controller USB/Valve-receiver compatibility is implemented in the source. For its both-grip shortcut scheme, build instructions, supported transports, and pending physical acceptance, see COMPATIBILITY.md. The illustrated quick-access-button guide below is for the newer controller.
+Original 2015 Steam Controller USB/Valve-receiver/Bluetooth LE compatibility is implemented in the source. For its both-grip shortcut scheme, build instructions, supported transports, and pending physical acceptance, see COMPATIBILITY.md. The illustrated quick-access-button guide below is for the newer controller.
 
 SC-Orbit turns the Steam Controller into a controller-first input system for
 MiSTer, with fluid trackball and spinner controls, gyro aiming, a virtual

@@ -355,6 +355,8 @@ struct hidraw_devinfo { u32 bustype; u16 vendor; u16 product; };
 #define KEY_7 8
 #define KEY_8 9
 #define KEY_9 10
+#define BUS_USB 0x03
+#define BUS_BLUETOOTH 0x05
 #define BUS_VIRTUAL 0x06
 
 #define O_RDONLY 0
@@ -376,7 +378,9 @@ struct hidraw_devinfo { u32 bustype; u16 vendor; u16 product; };
 #define PRODUCT_SC_WIRELESS 0x1142
 #define PRODUCT_SC_ALT      0x11fc
 #define PRODUCT_SC_VIRTUAL  0x11ff
-#define PRODUCT_SC_BLE      0x1201
+#define PRODUCT_SC_HEADCRAB 0x1201
+#define PRODUCT_SC_BLE      0x1105
+#define PRODUCT_SC_BLE2     0x1106
 #define PRODUCT_SC_LEGACY   0x0476
 
 static void copy_name(char *d,const char *s) { int i=0; while(i<79 && s[i]){ d[i]=s[i]; i++; } d[i]=0; }
@@ -691,7 +695,7 @@ static int load_user_profile(void){
 static int is_steam_product(u16 p){
     return p==PRODUCT_WIRED||p==PRODUCT_BT||p==PRODUCT_PUCK||
            p==PRODUCT_SC_WIRED||p==PRODUCT_SC_WIRELESS||p==PRODUCT_SC_ALT||
-           p==PRODUCT_SC_VIRTUAL||p==PRODUCT_SC_BLE||p==PRODUCT_SC_LEGACY;
+           p==PRODUCT_SC_VIRTUAL||p==PRODUCT_SC_HEADCRAB||p==PRODUCT_SC_BLE||p==PRODUCT_SC_BLE2||p==PRODUCT_SC_LEGACY;
 }
 static void path_num(char *out,const char *base,int n){
     int i=0,t=n,d=1;while(base[i]){out[i]=base[i];i++;}
@@ -700,19 +704,26 @@ static void path_num(char *out,const char *base,int n){
 }
 static int hid_scan_cursor=-1;
 static u16 active_product;
+static u32 active_bus;
+static int original_ble(void){return active_bus==BUS_BLUETOOTH&&(active_product==PRODUCT_SC_BLE||active_product==PRODUCT_SC_BLE2);}
+static int supported_hid_device(const struct hidraw_devinfo *info){
+    if(info->vendor!=STEAM_VENDOR||!is_steam_product(info->product))return 0;
+    if(info->product==PRODUCT_SC_BLE||info->product==PRODUCT_SC_BLE2)return info->bustype==BUS_BLUETOOTH;
+    return 1;
+}
 static int find_hidraw(void){
     int pass,i,fd;char p[32];struct hidraw_devinfo info;
     for(pass=1;pass<=32;pass++){
         i=(hid_scan_cursor+pass)&31;path_num(p,"/dev/hidraw",i);fd=(int)xopen(p,O_RDWR|O_NONBLOCK,0);if(fd<0)continue;
         memset(&info,0,sizeof(info));
-        if(xioctl(fd,HIDIOCGRAWINFO,&info)>=0&&info.vendor==STEAM_VENDOR&&is_steam_product(info.product)){
-            hid_scan_cursor=i;active_product=info.product;return fd;
+        if(xioctl(fd,HIDIOCGRAWINFO,&info)>=0&&supported_hid_device(&info)){
+            hid_scan_cursor=i;active_product=info.product;active_bus=info.bustype;return fd;
         }
         xclose(fd);
     }
     return -1;
 }
-static int original_controller(void){return active_product==PRODUCT_SC_WIRED||active_product==PRODUCT_SC_WIRELESS;}
+static int original_controller(void){return active_product==PRODUCT_SC_WIRED||active_product==PRODUCT_SC_WIRELESS||original_ble();}
 static int feature_report_id(void){
     return (active_product==PRODUCT_WIRED||active_product==PRODUCT_BT||active_product==PRODUCT_PUCK)?1:0;
 }
@@ -729,8 +740,29 @@ static int send_feature_cmd_id(int fd,int report_id,const u8 *cmd,int n){
     }
     return rc;
 }
+static int ble_output_warned;
+static int send_ble_feature(int fd,const u8 *cmd,int n){
+    u8 segment[20];int offset=0,index=0,count,rc;
+    if(n<1||n>64)return -1;
+    while(offset<n){
+        count=n-offset;if(count>18)count=18;
+        memset(segment,0,sizeof(segment));segment[0]=3;
+        segment[1]=(u8)(0x80|index|((offset+count==n)?0x40:0));
+        memcpy(segment+2,cmd+offset,(usize)count);
+        rc=(int)xioctl(fd,HIDIOCSFEATURE(20),segment);
+        /* An ambiguous/short write must never send the rest of a command.
+         * Do not retry a continuation: the next command starts at segment 0. */
+        if(rc!=20){
+            if(!ble_output_warned)log_text("SC-Orbit: BLE feature delivery failed; settings/haptic delivery is unconfirmed\n");
+            ble_output_warned=1;return rc<0?rc:-5;
+        }
+        offset+=count;index++;
+    }
+    return n;
+}
 static int send_feature_cmd(int fd,const u8 *cmd,int n){
     int preferred=feature_report_id(),rc;
+    if(original_ble())return send_ble_feature(fd,cmd,n);
     rc=send_feature_cmd_id(fd,preferred,cmd,n);
     if(rc<0&&!original_controller())rc=send_feature_cmd_id(fd,preferred?0:1,cmd,n);
     return rc;
@@ -742,6 +774,16 @@ static int configure_controller(int fd){
     u8 clear_map[1]={0x81};
     u8 pad_modes[8]={0x87,0x06,0x07,0x07,0x00,0x08,0x07,0x00};
     u8 imu_mode[5]={0x87,0x03,0x30,0x18,0x00};
+    if(original_ble()){
+        u8 packet_version[5]={0x87,0x03,0x31,0x02,0x00};
+        /* Packet version 2 and raw accel+gyro are the original BLE settings
+         * described by SDL. Allow 3ms between configuration commands. */
+        if(send_feature_cmd(fd,clear_map,1)<0)return -1;sleep_ms(3);
+        if(send_feature_cmd(fd,pad_modes,8)<0)return -1;sleep_ms(3);
+        if(send_feature_cmd(fd,packet_version,5)<0)return -1;sleep_ms(3);
+        if(send_feature_cmd(fd,imu_mode,5)<0)return -1;sleep_ms(3);
+        ble_output_warned=0;log_text("SC-Orbit: BLE input settings and raw IMU request delivered\n");return 0;
+    }
     int a=send_feature_cmd(fd,clear_map,1);
     int b=send_feature_cmd(fd,pad_modes,8);
     int c=send_feature_cmd(fd,imu_mode,5);
@@ -1079,7 +1121,7 @@ static s32 consume_q16(s32 *acc);
 static s32 mul_scale_q8(s32 v,s32 q8);
 
 
-/* Original USB/Valve-receiver protocol facts are documented in COMPATIBILITY.md.
+/* Original USB/receiver and BLE protocol facts are documented in COMPATIBILITY.md.
  * Independently implemented adapter: the processing engine still consumes its
  * existing 2026 layout. The untouched surface survives alternating reports. */
 enum report_result {REPORT_IGNORED,REPORT_STATE,REPORT_DISCONNECTED,REPORT_CONNECTED};
@@ -1087,25 +1129,8 @@ struct original_state {int connected;s16 stick_x,stick_y,pad_x,pad_y;u8 report[5
 static struct original_state original;
 static void put16(u8 *p,u16 v){p[0]=(u8)v;p[1]=(u8)(v>>8);}
 static void put32(u8 *p,u32 v){p[0]=(u8)v;p[1]=(u8)(v>>8);p[2]=(u8)(v>>16);p[3]=(u8)(v>>24);}
-static int decode_report(u16 product,struct original_state *state,const u8 *raw,int n,const u8 **out,int *out_n){
-    int pad,mixed,tuning,i;u8 *b=state->report;
-    *out=0;*out_n=0;
-    if(product!=PRODUCT_SC_WIRED&&product!=PRODUCT_SC_WIRELESS){
-        /* Preserve the existing newer USB/BT/puck report path byte-for-byte. */
-        if(n>=28&&(raw[0]==0x42||raw[0]==0x45||raw[0]==0x47)){*out=raw;*out_n=n;return REPORT_STATE;}
-        return REPORT_IGNORED;
-    }
-    if(n!=64||raw[0]!=1||raw[1]!=0)return REPORT_IGNORED;
-    if(raw[2]==3&&raw[3]==1&&(raw[4]==1||raw[4]==2)){
-        if(raw[4]==2&&state->connected)return REPORT_IGNORED;
-        memset(state,0,sizeof(*state));state->connected=raw[4]==2;
-        return raw[4]==1?REPORT_DISCONNECTED:REPORT_CONNECTED;
-    }
-    if(raw[2]!=1||raw[3]!=60)return REPORT_IGNORED;
-    state->connected=1;
-    pad=(raw[10]&8)!=0;mixed=(raw[10]&128)!=0;
-    if(pad){state->pad_x=le16s(raw+16);state->pad_y=le16s(raw+18);if(!mixed)state->stick_x=state->stick_y=0;}
-    else{state->stick_x=le16s(raw+16);state->stick_y=le16s(raw+18);if(!mixed)state->pad_x=state->pad_y=0;}
+static void normalize_original(struct original_state *state,const u8 *raw,int left_touch){
+    int tuning,i;u8 *b=state->report;
     memset(b,0,54);b[0]=0x42;b[1]=raw[4];
     if(raw[8]&128)b[2]|=1; if(raw[8]&32)b[2]|=2;
     if(raw[8]&64)b[2]|=4; if(raw[8]&16)b[2]|=8;
@@ -1119,7 +1144,7 @@ static int decode_report(u16 product,struct original_state *state,const u8 *raw,
     if(raw[10]&4)b[4]|=64; if(raw[8]&1)b[4]|=128;
     /* Original stick has no capacitive touch sensor. Click is its gyro clutch. */
     if(raw[10]&64)b[5]|=1;
-    if(pad||mixed)b[5]|=2;
+    if(left_touch)b[5]|=2;
     if(raw[10]&2)b[5]|=4; if(raw[8]&2)b[5]|=8;
     tuning=(raw[9]&128)&&(raw[10]&1);
     if(tuning){
@@ -1142,7 +1167,97 @@ static int decode_report(u16 product,struct original_state *state,const u8 *raw,
     for(i=0;i<12;i++)b[34+i]=raw[28+i];
     /* Original gyro Y has the opposite raw sign to the newer controller. */
     put16(b+42,(u16)(s16)clamp32(-((s32)le16s(raw+36)),-32768,32767));
-    *out=b;*out_n=54;return REPORT_STATE;
+}
+static int decode_ble_report(struct original_state *state,const u8 *raw,int n,const u8 **out,int *out_n);
+static int decode_report(u16 product,struct original_state *state,const u8 *raw,int n,const u8 **out,int *out_n){
+    int pad,mixed;
+    if(product==PRODUCT_SC_BLE||product==PRODUCT_SC_BLE2){
+        *out=0;*out_n=0;
+        if(!original_ble())return REPORT_IGNORED;
+        return decode_ble_report(state,raw,n,out,out_n);
+    }
+    *out=0;*out_n=0;
+    if(product!=PRODUCT_SC_WIRED&&product!=PRODUCT_SC_WIRELESS){
+        /* Preserve the existing newer USB/BT/puck report path byte-for-byte. */
+        if(n>=28&&(raw[0]==0x42||raw[0]==0x45||raw[0]==0x47)){*out=raw;*out_n=n;return REPORT_STATE;}
+        return REPORT_IGNORED;
+    }
+    if(n!=64||raw[0]!=1||raw[1]!=0)return REPORT_IGNORED;
+    if(raw[2]==3&&raw[3]==1&&(raw[4]==1||raw[4]==2)){
+        if(raw[4]==2&&state->connected)return REPORT_IGNORED;
+        memset(state,0,sizeof(*state));state->connected=raw[4]==2;
+        return raw[4]==1?REPORT_DISCONNECTED:REPORT_CONNECTED;
+    }
+    if(raw[2]!=1||raw[3]!=60)return REPORT_IGNORED;
+    state->connected=1;
+    pad=(raw[10]&8)!=0;mixed=(raw[10]&128)!=0;
+    if(pad){state->pad_x=le16s(raw+16);state->pad_y=le16s(raw+18);if(!mixed)state->stick_x=state->stick_y=0;}
+    else{state->stick_x=le16s(raw+16);state->stick_y=le16s(raw+18);if(!mixed)state->pad_x=state->pad_y=0;}
+    normalize_original(state,raw,pad||mixed);
+    *out=state->report;*out_n=54;return REPORT_STATE;
+}
+
+
+/* Compact BLE state has no frame counter. The mask gives its exact logical
+ * size; transport pads the final 18-byte segment. Unknown masks are atomic
+ * rejects, never an excuse to parse a guessed offset. */
+#define BLE_FRAGMENT_TIMEOUT_MS 250U
+#define BLE_GYRO_TIMEOUT_MS 250U
+struct ble_assembly {u8 data[54];int expected,segments;u32 started_ms;};
+struct ble_state {u8 raw[64];u32 imu_sequence,last_gyro_ms;int accel_ready,gyro_ready,gyro_fresh;};
+static struct ble_assembly ble_assembly;
+static struct ble_state ble;
+static int ble_payload_size(u16 mask){
+    static const u8 sizes[9]={3,2,3,4,4,4,6,6,8};int i,n=2;
+    if(!mask||(mask&~0x1ff0))return 0;
+    for(i=0;i<9;i++)if(mask&(0x10u<<i))n+=sizes[i];
+    return n;
+}
+static int decode_ble_report(struct original_state *state,const u8 *raw,int n,const u8 **out,int *out_n){
+    struct original_state next;struct ble_state next_ble;
+    int index,last,total,offset;u16 mask;const u8 *p;u32 now=monotonic_ms();
+    *out=0;*out_n=0;
+    if(n<1||raw[0]!=3)return REPORT_IGNORED;
+    if(n!=20||(raw[1]&0x38)){memset(&ble_assembly,0,sizeof(ble_assembly));return REPORT_IGNORED;}
+    if(!(raw[1]&0x80))return REPORT_IGNORED; /* Empty polls do not extend expiry. */
+    index=raw[1]&7;last=(raw[1]&0x40)!=0;
+    if(ble_assembly.expected&&(u32)(now-ble_assembly.started_ms)>BLE_FRAGMENT_TIMEOUT_MS)
+        memset(&ble_assembly,0,sizeof(ble_assembly));
+    if(index==0){
+        memset(&ble_assembly,0,sizeof(ble_assembly));
+        if((raw[2]&15)!=4)return REPORT_IGNORED; /* Status 5 isn't input. */
+        mask=(u16)((raw[2]&0xf0)|((u16)raw[3]<<8));total=ble_payload_size(mask);
+        if(!total)return REPORT_IGNORED;
+        ble_assembly.segments=(total+17)/18;ble_assembly.started_ms=now;
+    }else if(!ble_assembly.expected||index!=ble_assembly.expected){
+        memset(&ble_assembly,0,sizeof(ble_assembly));return REPORT_IGNORED;
+    }
+    if(index>=ble_assembly.segments||last!=(index==ble_assembly.segments-1)){
+        memset(&ble_assembly,0,sizeof(ble_assembly));return REPORT_IGNORED;
+    }
+    memcpy(ble_assembly.data+index*18,raw+2,18);
+    if(!last){ble_assembly.expected=index+1;return REPORT_IGNORED;}
+    ble_assembly.expected=0;
+    p=ble_assembly.data;mask=(u16)((p[0]&0xf0)|((u16)p[1]<<8));offset=2;
+    next=*state;next_ble=ble;next.connected=1;
+    if(mask&0x10){memcpy(next_ble.raw+8,p+offset,3);offset+=3;}
+    if(mask&0x20){memcpy(next_ble.raw+11,p+offset,2);offset+=2;}
+    if(mask&0x40)offset+=3; /* Known extended buttons, absent on original hardware. */
+    if(mask&0x80){next.stick_x=le16s(p+offset);next.stick_y=le16s(p+offset+2);offset+=4;}
+    if(mask&0x100){next.pad_x=le16s(p+offset);next.pad_y=le16s(p+offset+2);offset+=4;}
+    if(mask&0x200){memcpy(next_ble.raw+20,p+offset,4);offset+=4;}
+    if(mask&0x400){memcpy(next_ble.raw+28,p+offset,6);offset+=6;next_ble.accel_ready=1;}
+    next_ble.gyro_fresh=(mask&0x800)!=0;
+    if(next_ble.gyro_fresh){
+        memcpy(next_ble.raw+34,p+offset,6);offset+=6;
+        next_ble.imu_sequence++;next_ble.last_gyro_ms=now;next_ble.gyro_ready=1;
+    }
+    if(mask&0x1000)offset+=8; /* Quaternion isn't used by Orbit's raw-gyro engine. */
+    /* All optional chunks were bounded by the mask before any canonical write. */
+    if(offset!=ble_payload_size(mask))return REPORT_IGNORED;
+    put32(next_ble.raw+4,next_ble.imu_sequence);
+    normalize_original(&next,next_ble.raw,(next_ble.raw[10]&8)!=0);
+    *state=next;ble=next_ble;*out=state->report;*out_n=54;return REPORT_STATE;
 }
 
 /* -------------------------------------------------------------------------
@@ -1479,13 +1594,20 @@ static void process_gyro(int hid,int mouse,int spinner,const u8 *b,int n,int act
     s32 plx=0,ply=0,prx=0,pry=0;
     int stable;
     if(n<46){if(gyro.touch_prev){gyro_trace_flush();gyro_trace_reset_session();}gyro_reset_motion();gyro_reset_rest_window();gyro.active_prev=gyro.touch_prev=0;gyro.timestamp_ready=gyro.timestamp_kind=0;return;}
+    if(original_ble()&&(!ble.gyro_ready||!ble.accel_ready)){
+        gyro_reset_motion();gyro.touch_prev=0;return;
+    }
     plx=le16s(b+10);ply=-le16s(b+12);prx=le16s(b+14);pry=-le16s(b+16);
     if(iabs32(plx)<1800)plx=0;if(iabs32(ply)<1800)ply=0;if(iabs32(prx)<1800)prx=0;if(iabs32(pry)<1800)pry=0;
     gyro_stick_update_clutches(stick_active_mask&gyro.stick_mode);
     gyro_stick_update_physical(stick_active_mask&gyro.stick_mode,plx,ply,prx,pry);
     if(active&&!gyro.touch_prev){gyro_trace_reset_session();gyro.activation_reports=0;gyro.rest_latched=0;gyro.rest_exit_reports=0;gyro.filt_pitch_q8=gyro.filt_yaw_q8=gyro.out_x_q16=gyro.out_y_q16=gyro.paddle_q16=0;}
     if(!active&&gyro.touch_prev){gyro_trace_flush();gyro_trace_reset_session();gyro_reset_motion();}
-    gyro.touch_prev=active?1:0;if(!gyro_fresh_dt(b,n,&dt_us)){if(!active)gyro_reset_motion();return;}
+    gyro.touch_prev=active?1:0;
+    if(original_ble()&&(!ble.gyro_fresh||!ble.accel_ready)){
+        if(!active)gyro_reset_motion();return;
+    }
+    if(!gyro_fresh_dt(b,n,&dt_us)){if(!active)gyro_reset_motion();return;}
     ax=le16s(b+34);ay=le16s(b+36);az=le16s(b+38);gx=le16s(b+40);gy=le16s(b+42);gz=le16s(b+44);
     gyro.total_reports++;gyro.fresh_reports++;gyro.last_dt_us=dt_us;gyro_sensor_deltas(ax,ay,az,gx,gy,gz);
     if(voice_busy){gyro_reset_motion();gyro_reset_rest_window();gyro.active_prev=0;return;}
@@ -2492,17 +2614,26 @@ static void process_report(int hid,int gp,int mouse,int spinner,int keypad,const
     ms.spinner_touch_prev=(gyro_paddle_mode||cfg.numpad_enabled)?0:spinner_touch;ms.trackball_touch_prev=trackball_touch;
 }
 
+static void reset_ble_input(void){memset(&ble,0,sizeof(ble));memset(&ble_assembly,0,sizeof(ble_assembly));}
+static void expire_ble_gyro(int gp){
+    if(original_ble()&&ble.gyro_ready&&(u32)(monotonic_ms()-ble.last_gyro_ms)>BLE_GYRO_TIMEOUT_MS){
+        ble.gyro_ready=ble.gyro_fresh=0;gyro_reset_motion();gyro_reset_rest_window();
+        gyro.timestamp_ready=gyro.timestamp_kind=0;
+        emit_gamepad_state(gp,original.report,tuning_prev||post_tune_block);
+    }
+}
 static void release_controller_outputs(int hid,int gp,int mouse,int spinner,int keypad){
     neutralize_gamepad(gp);release_trackball_mouse_click(mouse);
     spinner_primary(spinner,0);spinner_secondary(spinner,0);release_numpad_key(keypad);
     voice_cancel(hid);zero_motion();memset(&ms,0,sizeof(ms));ms.trackball_source_pad=-1;gyro_reset_motion();gyro_reset_rest_window();
     gyro.timestamp_ready=gyro.timestamp_kind=gyro.touch_prev=gyro.active_prev=0;
     numpad_click_prev=numpad_rearm=numpad_hover_key=numpad_hover_candidate=numpad_hover_reports=0;
-    memset(&original,0,sizeof(original));prev_shortcuts=0;tuning_prev=0;post_tune_block=0;
+    memset(&original,0,sizeof(original));reset_ble_input();prev_shortcuts=0;tuning_prev=0;post_tune_block=0;
 }
 /* This is the single production entry point exercised by the host tests. */
 static int process_input_report(int hid,int gp,int mouse,int spinner,int keypad,const u8 *raw,int n){
     const u8 *b;int length,result;
+    expire_ble_gyro(gp);
     result=decode_report(active_product,&original,raw,n,&b,&length);
     if(result==REPORT_STATE)process_report(hid,gp,mouse,spinner,keypad,b,length);
     else if(result==REPORT_DISCONNECTED||result==REPORT_CONNECTED){
@@ -2514,7 +2645,7 @@ static int process_input_report(int hid,int gp,int mouse,int spinner,int keypad,
 static int run_controller(int hid,int gp,int mouse,int spinner,int keypad){
     u8 b[128];long n;int misses=0,active=0,drained;u32 next_coast,next_rescan,next_reassert,last_state_ms=monotonic_ms();
     (void)configure_controller(hid);
-    gyro_defaults();memset(&original,0,sizeof(original));
+    gyro_defaults();memset(&original,0,sizeof(original));reset_ble_input();ble_output_warned=0;
     memset(&voice_rt,0,sizeof(voice_rt));voice_busy=voice_rendering=0;
     memset(&ms,0,sizeof(ms));ms.trackball_source_pad=-1;memset(&gos,0,sizeof(gos));prev_shortcuts=0;tuning_prev=0;post_tune_block=0;mouse_left_state=0;mouse_right_state=0;spinner_primary_state=0;spinner_secondary_state=0;trackball_click_prev=0;trackball_click_button=TRACKBALL_CLICK_NONE;numpad_key_down=0;numpad_click_prev=0;numpad_rearm=0;numpad_hover_key=numpad_hover_candidate=numpad_hover_reports=0;
     next_coast=monotonic_ms()+4U;next_rescan=monotonic_ms()+3000U;next_reassert=monotonic_ms()+5000U;
@@ -2540,7 +2671,7 @@ static int run_controller(int hid,int gp,int mouse,int spinner,int keypad){
         }
         if(!active){if(!got)misses++;if(misses>2000)return -2;}
         if(active){
-            u32 now=monotonic_ms();
+            u32 now=monotonic_ms();expire_ble_gyro(gp);
             /* Original wireless receiver remains present when its controller
              * vanishes. Battery/status traffic must not keep held input alive. */
             if(original_controller()&&(u32)(now-last_state_ms)>2000U){release_controller_outputs(hid,gp,mouse,spinner,keypad);return -1;}

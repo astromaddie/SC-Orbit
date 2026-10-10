@@ -17,3 +17,9 @@ hardware protocol documentation in Linux hid-steam.c. Thanks to the Linux
 hid-steam contributors for the button, multiplexed-axis, IMU, feature-report,
 and haptic-pulse protocol reference. No Linux driver implementation was copied;
 SC-Orbit remains MIT-licensed. See COMPATIBILITY.md for reference details.
+
+The original Bluetooth LE transport was independently implemented from protocol
+facts documented by SDL contributors in SDL_hidapi_steam.c, controller_structs.h,
+controller_constants.h, and controller_list.h, pinned to SDL commit
+ea3042350d3aac4b83ae83047185ba703d8f0a5c. No SDL implementation was copied.
+See COMPATIBILITY.md for transport boundaries, provenance, and acceptance limits.

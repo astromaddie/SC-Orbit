@@ -1,6 +1,6 @@
 # SC-Orbit
 
-> Original 2015 Steam Controller USB/Valve-receiver compatibility is implemented in the source. For its both-grip shortcut scheme, build instructions, supported transports, and pending physical acceptance, see [COMPATIBILITY.md](COMPATIBILITY.md). The illustrated quick-access-button guide below is for the newer controller.
+> Original 2015 Steam Controller USB/Valve-receiver/Bluetooth LE compatibility is implemented in the source. For its both-grip shortcut scheme, build instructions, supported transports, and pending physical acceptance, see [COMPATIBILITY.md](COMPATIBILITY.md). The illustrated quick-access-button guide below is for the newer controller.
 
 **Turn the Steam Controller into a trackball, spinner, mouse, gyro controller, number pad, and more on MiSTer FPGA.**
 
