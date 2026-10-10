@@ -2,10 +2,22 @@
 
 The source supports original 2015 Steam Controllers over wired USB (`28de:1102`)
 and the Valve USB wireless receiver (`28de:1142`), alongside the existing 2026
-controller path. Original Bluetooth LE (`1201`) uses a different protocol and is
-**not implemented**. The pre-existing discovery aliases `11fc`, `11ff`, and `0476`
-are not evidence of original-controller support; the original decoder and feature
-commands are selected only for `1102` and `1142`.
+controller path. Original Bluetooth LE uses a different protocol and is
+**not implemented**. SDL lists original Bluetooth variants as `1105`/`1106`;
+`1201` is a wired HEADCRAB variant, not the original controller's BLE ID. The
+pre-existing discovery aliases `11fc`, `11ff`, `1201`, and `0476` are not evidence
+of original-controller support; the original decoder and feature commands are
+selected only for `1102` and `1142`.
+
+Original BLE support is feasible but requires its own transport adapter. SDL's
+implementation assembles 20-byte reports (18 payload bytes per segment), decodes
+optional button/axis/IMU chunks while retaining omitted state, and segments
+outgoing feature commands. The implemented USB/receiver adapter instead expects
+complete 64-byte state reports and sends 65-byte feature buffers. BLE therefore
+needs packet assembly, chunk decoding, feature transport, discovery, and physical
+pairing/reconnect checks; enabling another device ID alone would not add it.
+See SDL's [Steam Controller driver](https://github.com/libsdl-org/SDL/blob/main/src/joystick/hidapi/SDL_hidapi_steam.c)
+and [controller ID list](https://github.com/libsdl-org/SDL/blob/main/src/joystick/controller_list.h).
 
 The original-controller implementation has host tests and an ARM build. The
 installer and tracked binary in this fork are marked as an original-controller
